@@ -95,6 +95,19 @@ class Disk:
         self.avail = avail
         self.util = 100.0 * used / total if total > 0 else 0
 
+class INode:
+    def __init__(self, mount, file_system, total, used, avail):
+        self.mount = mount
+        self.file_system = file_system
+        self.used = used
+        self.avail = avail
+        self.util = 100.0 * used / total if total > 0 else 0
+
+class LoadAvarageData:
+    def __init__(self, one_minutes, five_minutes, fifteen_minutes):
+        self.one_minutes = one_minutes
+        self.five_minutes = five_minutes
+        self.fifteen_minutes = fifteen_minutes
 
 class Metrics:
     def __init__(self, instance_id, instance_type, image_id, aggregated,
@@ -170,7 +183,7 @@ Examples
  To set a five-minute cron schedule to report memory and disk space utilization
  to CloudWatch
 
-  */5 * * * * ~/aws-scripts-mon/mon-put-instance-data.py --mem-util --disk-space-util --disk-path=/ --from-cron
+  */5 * * * * ~/aws-scripts-mon/mon-put-instance-data.py --mem-util --disk-space-util --disk-path=/ --from-cron --inode-space-util --inode-path=/ --load-average
 
 For more information on how to use this utility, see project home on GitHub:
 https://github.com/osiegmar/cloudwatch-mon-scripts-python
@@ -222,6 +235,20 @@ https://github.com/osiegmar/cloudwatch-mon-scripts-python
                             type=to_lower,
                             choices=size_units,
                             help='Specifies units for disk space metrics.')
+
+    inode_group = parser.add_argument_group('inode metrics')
+    inode_group.add_argument('--inode-path',
+                            metavar='PATH',
+                            action='append',
+                            help='Selects the disk by the path on which to report.')
+    inode_group.add_argument('--inode-space-util',
+                            action='store_true',
+                            help='Reports inode space utilization in percentages.')
+
+    load_group = parser.add_argument_group('load average metrics')
+    load_group.add_argument('--load-average',
+                            action='store_true',
+                            help='Report load average.')
 
     exclusive_group = parser.add_mutually_exclusive_group()
     exclusive_group.add_argument('--from-cron',
@@ -305,6 +332,36 @@ def add_disk_metrics(args, metrics):
                                disk.avail / disk_unit_div,
                                disk.mount, disk.file_system)
 
+def get_inode_info(paths):
+    df_out = [s.split() for s in
+              os.popen('/bin/df -i ' +
+                       ' '.join(paths)).read().splitlines()]
+    inodes = []
+    for line in df_out[1:]:
+        mount = line[5]
+        file_system = line[0]
+        total = int(line[1])
+        used = int(line[2])
+        avail = int(line[3])
+        inodes.append(Disk(mount, file_system, total, used, avail))
+    return inodes
+
+
+def add_inode_metrics(args, metrics):
+    disks = get_inode_info(args.inode_path)
+    for disk in disks:
+        if args.inode_space_util:
+            metrics.add_metric('DiskiNodeUtilization', 'Percent',
+                               disk.util, disk.mount, disk.file_system)
+
+def get_load_info():
+    uptime_out = os.popen('/usr/bin/uptime').read()
+    uptime_out = uptime_out.split('average:')[1].strip().split(',')
+    return LoadAvarageData(uptime_out[0], uptime_out[1], uptime_out[2])
+
+def add_load_metrics(args, metrics):
+    load_info = get_load_info()
+    metrics.add_metric('LoadAverage', 'Count', load_info.one_minutes)
 
 def send_metrics(region, metrics, verbose):
     boto_debug = 2 if verbose else 0
@@ -348,6 +405,8 @@ def validate_args(args):
     report_mem_data = args.mem_util or args.mem_used or args.mem_avail or \
         args.swap_util or args.swap_used
     report_disk_data = args.disk_path is not None
+    report_inode_data = args.inode_path is not None
+    report_load_data = args.load_average is not None
 
     if report_disk_data:
         if not args.disk_space_util and not args.disk_space_used and \
@@ -364,11 +423,21 @@ def validate_args(args):
         raise ValueError('Metrics to report disk space are provided but '
                          'disk path is not specified.')
 
-    if not report_mem_data and not report_disk_data:
+    if report_inode_data:
+        if not args.inode_path:
+            raise ValueError('Metrics to report inode util are provided but '
+                             'inode path is not specified.')
+
+        for path in args.inode_path:
+            if not os.path.isdir(path):
+                raise ValueError('INode file path ' + path +
+                                 ' does not exist or cannot be accessed.')
+
+    if not report_mem_data and not report_disk_data and not report_inode_data and not report_load_data:
         raise ValueError('No metrics specified for collection and '
                          'submission to CloudWatch.')
 
-    return report_disk_data, report_mem_data
+    return report_disk_data, report_mem_data, report_inode_data, report_load_data
 
 
 def main():
@@ -386,7 +455,7 @@ def main():
         return 0
 
     try:
-        report_disk_data, report_mem_data = validate_args(args)
+        report_disk_data, report_mem_data, report_inode_data, report_load_data = validate_args(args)
 
         # avoid a storm of calls at the beginning of a minute
         if args.from_cron:
@@ -423,6 +492,12 @@ def main():
 
         if report_disk_data:
             add_disk_metrics(args, metrics)
+
+        if report_inode_data:
+            add_inode_metrics(args, metrics)
+
+        if report_load_data:
+            add_load_metrics(args, metrics)
 
         if args.verbose:
             print 'Request:\n' + str(metrics)
